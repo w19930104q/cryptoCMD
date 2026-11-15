@@ -70,6 +70,7 @@ class CmcScraper(object):
             "Time Close",
         ]
         self.rows = []
+        self.completeness = None
         self.id_number = id_number
 
         # enable all_time download if start_time or end_time is not given
@@ -103,6 +104,11 @@ class CmcScraper(object):
         if self.all_time:
             self.start_date, self.end_date = None, None
 
+        # Clear rows up front so a failed (re)download can never serve a
+        # stale, seemingly-complete concatenation from a previous call.
+        self.rows = []
+        self.completeness = None
+
         coin_data = download_coin_data(
             self.coin_code,
             self.start_date,
@@ -111,7 +117,9 @@ class CmcScraper(object):
             self.coin_name,
             self.id_number,
         )
+        self.completeness = coin_data.get("completeness")
 
+        rows = []
         for _row in coin_data["data"]["quotes"]:
             _row_quote = _row["quote"]
             date = datetime.strptime(
@@ -132,7 +140,9 @@ class CmcScraper(object):
                 _row["timeClose"],
             ]
 
-            self.rows.insert(0, row)
+            rows.insert(0, row)
+
+        self.rows = rows
 
         if self.rows:
             self.end_date, self.start_date = self.rows[0][0], self.rows[-1][0]

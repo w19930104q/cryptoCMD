@@ -112,14 +112,20 @@ def download_coin_data(
     end_dt = datetime.datetime.strptime(end_date, "%d-%m-%Y").replace(
         tzinfo=datetime.timezone.utc
     )
+    start_day = start_dt.date()
+    end_day = end_dt.date()
 
     try:
         # CMC caps responses at ~365 entries per request; split into yearly chunks
         # so long/all-time ranges always return daily granularity.
         # timeStart is exclusive (first returned day = timeStart + 1), so each
-        # chunk's timeStart equals the previous chunk's timeEnd — no overlap, no gap.
-        all_quotes = []
+        # chunk's timeStart equals the previous chunk's timeEnd. Chunks therefore
+        # overlap by one day when the API treats timeStart as inclusive; the
+        # day-keyed merge below deduplicates that overlap and refuses to
+        # silently pick between conflicting quotes.
+        chunks = []
         result_json = None
+        chunk_meta = None
         chunk_start = start_dt - datetime.timedelta(days=1)
 
         while chunk_start < end_dt:
@@ -134,17 +140,43 @@ def download_coin_data(
                 int(chunk_start.timestamp()),
                 int(chunk_end.timestamp()),
             )
-            json_data = get_url_data(api_url).json()
+            try:
+                json_data = get_url_data(api_url).json()
+            except Exception as e:
+                raise DataDownloadError(
+                    "Failed to download chunk {}..{}: {}".format(
+                        chunk_start.date().isoformat(),
+                        chunk_end.date().isoformat(),
+                        e,
+                    )
+                ) from e
             status = json_data.get("status", {})
             error_code = status.get("error_code")
             if error_code and str(error_code) != "0":
                 raise Exception(status.get("error_message", "Unknown error"))
+            data = json_data["data"]
+            meta = (data.get("id"), data.get("symbol"), data.get("name"))
             if result_json is None:
                 result_json = json_data
-            all_quotes.extend(json_data["data"]["quotes"])
-            chunk_start = chunk_end + datetime.timedelta(days=1)
+                chunk_meta = meta
+            elif meta != chunk_meta:
+                raise DataIntegrityError(
+                    "Chunk {}..{} returned coin {} but previous chunks returned "
+                    "{}; refusing to merge data across instruments.".format(
+                        chunk_start.date().isoformat(),
+                        chunk_end.date().isoformat(),
+                        meta,
+                        chunk_meta,
+                    )
+                )
+            chunks.append(data["quotes"])
+            chunk_start = chunk_end
 
-        result_json["data"]["quotes"] = all_quotes
+        merged = _merge_quotes(chunks, start_day, end_day)
+        result_json["data"]["quotes"] = [merged[day] for day in sorted(merged)]
+        result_json["completeness"] = _completeness_report(
+            merged, start_day, end_day
+        )
 
         if id_number:
             show_coin_info = False
@@ -178,6 +210,54 @@ def download_coin_data(
         raise e
 
 
+def _quote_day(quote):
+    """Trading day (UTC date) of a CMC quote, used as the canonical merge key."""
+    return datetime.datetime.strptime(quote["timeOpen"][:10], "%Y-%m-%d").date()
+
+
+def _merge_quotes(chunks, start_day, end_day):
+    """
+    Merge per-chunk quote lists keyed by trading day.
+
+    Quotes outside [start_day, end_day] are clipped. Identical duplicates
+    (e.g. from the one-day chunk overlap) are deduplicated; two different
+    quotes for the same day raise DataIntegrityError rather than picking
+    one arbitrarily.
+    """
+    merged = {}
+    for quotes in chunks:
+        for quote in quotes:
+            day = _quote_day(quote)
+            if day < start_day or day > end_day:
+                continue
+            existing = merged.get(day)
+            if existing is None:
+                merged[day] = quote
+            elif existing != quote:
+                raise DataIntegrityError(
+                    "Conflicting quotes for {} across response chunks; "
+                    "refusing to pick one arbitrarily.".format(day.isoformat())
+                )
+    return merged
+
+
+def _completeness_report(merged, start_day, end_day):
+    """Report which days in the requested range have no quote."""
+    total_days = (end_day - start_day).days + 1
+    missing = [
+        (start_day + datetime.timedelta(days=i)).isoformat()
+        for i in range(total_days)
+        if start_day + datetime.timedelta(days=i) not in merged
+    ]
+    return {
+        "startDate": start_day.isoformat(),
+        "endDate": end_day.isoformat(),
+        "expectedDays": total_days,
+        "receivedDays": len(merged),
+        "missingDays": missing,
+    }
+
+
 def _replace(s, bad_chars):
     if sys.version_info > (3, 0):
         # For Python 3
@@ -197,3 +277,13 @@ class InvalidParameters(ValueError):
 
 class InvalidCoinCode(NotImplementedError):
     """This coin code is unavailable on 'coinmarketcap.com'"""
+
+
+class DataIntegrityError(Exception):
+    """Merged market data failed integrity checks (conflicting quotes or
+    instrument drift between response chunks)."""
+
+
+class DataDownloadError(Exception):
+    """A chunk of the requested range could not be downloaded; no partial
+    result is returned."""
